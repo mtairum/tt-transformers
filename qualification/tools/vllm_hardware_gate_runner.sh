@@ -685,7 +685,7 @@ def call(prompt):
 count=spec["input_tokens"]
 if spec["kind"]=="cached_prefill":
     common=spec["common_prefix_tokens"]; prompts=[[42]*common+[43]*(count-common),[42]*common+[44]*(count-common)]
-else:prompts=[[42]*count]
+else:prompts=[[45 if spec["kind"]=="chunked_prefill" else 42]*count]
 snapshots=[metrics()]; calls=[]
 for prompt in prompts:
     calls.append(call(prompt)); snapshots.append(metrics())

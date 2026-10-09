@@ -659,7 +659,7 @@ class ContextInstrumentationTest(unittest.TestCase):
                 common = subcase["common_prefix_tokens"]
                 prompts = [[42] * common + [43] * (count - common), [42] * common + [44] * (count - common)]
             else:
-                prompts = [[42] * count]
+                prompts = [[45 if kind == "chunked_prefill" else 42] * count]
             calls = [
                 {
                     "request": {
@@ -704,6 +704,14 @@ class ContextInstrumentationTest(unittest.TestCase):
             "chunked_prefill": [metrics_text(0), metrics_text(4032)],
             "cached_prefill": [metrics_text(4032), metrics_text(5056), metrics_text(6080)],
         }
+
+    def test_chunked_prefill_prompt_shares_no_block_with_the_earlier_subcases(self) -> None:
+        """long_prefill runs first and caches its blocks; a chunked_prefill prompt
+        with the same leading tokens would be served from that cache and never split."""
+
+        source = RUNNER_PATH.read_text()
+        self.assertIn('[45 if spec["kind"]=="chunked_prefill" else 42]*count', validator.CONTEXT_CLIENT_PROGRAM)
+        self.assertIn(validator.CONTEXT_CLIENT_PROGRAM, source)
 
     def test_hit_tokens_sum_every_engine_and_ignore_other_series(self) -> None:
         self.assertEqual(validator.prefix_cache_hit_tokens(metrics_text(1024, 512)), 1536)

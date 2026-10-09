@@ -93,7 +93,7 @@ def call(prompt):
 count=spec["input_tokens"]
 if spec["kind"]=="cached_prefill":
     common=spec["common_prefix_tokens"]; prompts=[[42]*common+[43]*(count-common),[42]*common+[44]*(count-common)]
-else:prompts=[[42]*count]
+else:prompts=[[45 if spec["kind"]=="chunked_prefill" else 42]*count]
 snapshots=[metrics()]; calls=[]
 for prompt in prompts:
     calls.append(call(prompt)); snapshots.append(metrics())
@@ -1465,7 +1465,10 @@ def validate_context_subcases(
                     validation,
                 )
                 validation.equal(request.get("model"), row["manifest"]["model"], f"{row_id}/{kind}: call {index} model")
-                expected_prompt = [42] * subcase["input_tokens"]
+                # chunked_prefill uses its own token: long_prefill has already
+                # cached every block of a [42] prompt, which would leave nothing
+                # to split.
+                expected_prompt = [45 if kind == "chunked_prefill" else 42] * subcase["input_tokens"]
                 if kind == "cached_prefill":
                     common = subcase["common_prefix_tokens"]
                     expected_prompt = [42] * common + [43 + index] * (subcase["input_tokens"] - common)
