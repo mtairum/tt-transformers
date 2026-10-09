@@ -676,16 +676,20 @@ if tier == "benchmark":
     record["client"] = {"kind": "process", "cwd": execution["plugin_dir"], "argv": client_argv, "env": client_env}
     context_program = r'''import json,pathlib,sys,urllib.request
 spec=json.loads(sys.argv[1]); host=sys.argv[2]; port=sys.argv[3]; model=sys.argv[4]; output=pathlib.Path(sys.argv[5])
+def metrics():
+    with urllib.request.urlopen(f"http://{host}:{port}/metrics",timeout=60) as response:return response.read().decode()
 def call(prompt):
     payload={"model":model,"prompt":prompt,"max_tokens":spec["output_tokens"],"temperature":0,"ignore_eos":True}
     request=urllib.request.Request(f"http://{host}:{port}/v1/completions",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST")
     with urllib.request.urlopen(request,timeout=1800) as response:return {"request":payload,"response":json.loads(response.read())}
 count=spec["input_tokens"]
 if spec["kind"]=="cached_prefill":
-    common=spec["common_prefix_tokens"]; first=[42]*common+[43]*(count-common); second=[42]*common+[44]*(count-common)
-    calls=[call(first),call(second)]
-else:calls=[call([42]*count)]
-output.write_text(json.dumps({"schema_version":1,"subcase":spec,"calls":calls},indent=2)+"\n")'''
+    common=spec["common_prefix_tokens"]; prompts=[[42]*common+[43]*(count-common),[42]*common+[44]*(count-common)]
+else:prompts=[[42]*count]
+snapshots=[metrics()]; calls=[]
+for prompt in prompts:
+    calls.append(call(prompt)); snapshots.append(metrics())
+output.write_text(json.dumps({"schema_version":2,"subcase":spec,"calls":calls,"metrics":snapshots},indent=2)+"\n")'''
     context_clients = {}
     for subcase in manifest["context_subcases"]:
         kind = subcase["kind"]
@@ -1061,11 +1065,16 @@ case=pathlib.Path(sys.argv[1]); kind=sys.argv[2]; start=int(sys.argv[3]); end=in
 segment=(case/"server.log").read_bytes()[start:end]
 result_path=case/"context_subcases"/kind/"result.json"
 result=json.loads(result_path.read_text()) if result_path.exists() else None
-counts={
- "chunk_events":len(re.findall(rb"(?:chunked[^\n]*prefill|prefill[^\n]*chunk)",segment,re.I)),
- "cache_hits":len(re.findall(rb"(?:cache[^\n]*hit|prefix[^\n]*cache[^\n]*hit)",segment,re.I)),
-}
-evidence={"schema_version":1,"server_log_start":start,"server_log_end":end,"server_segment_sha256":hashlib.sha256(segment).hexdigest(),"instrumentation_counts":counts,"result":result}
+snapshots=result.get("metrics") if isinstance(result,dict) else None
+def hit_tokens(text):
+    values=re.findall(r"^vllm:prefix_cache_hits_total(?:\{[^}\n]*\})? (\S+)$",text,re.M)
+    return sum(float(value) for value in values) if values else None
+hits=None
+if isinstance(snapshots,list) and len(snapshots)>=2:
+    before,after=hit_tokens(snapshots[-2]),hit_tokens(snapshots[-1])
+    if before is not None and after is not None:hits=int(after-before)
+counts={"chunk_events":len(re.findall(rb"Prefill chunk for request ",segment)),"last_call_cache_hit_tokens":hits}
+evidence={"schema_version":2,"server_log_start":start,"server_log_end":end,"server_segment_sha256":hashlib.sha256(segment).hexdigest(),"instrumentation_counts":counts,"result":result}
 (case/"context_subcases"/kind/"evidence.json").write_text(json.dumps(evidence,indent=2)+"\n")
 PY
         ((exit_code == 0)) || return "$exit_code"

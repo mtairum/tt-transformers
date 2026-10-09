@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -602,6 +603,159 @@ class EvidenceContractTest(unittest.TestCase):
             and isinstance(node.value.value, str)
         ]
         self.assertEqual(values, [validator.CONTEXT_CLIENT_PROGRAM])
+
+
+def metrics_text(*engine_hits: float) -> str:
+    """A /metrics body with one prefix-cache hit series per engine."""
+
+    lines = [
+        "# HELP vllm:prefix_cache_hits_total Prefix cache hits, in terms of number of cached tokens.",
+        "# TYPE vllm:prefix_cache_hits_total counter",
+    ]
+    for engine, hits in enumerate(engine_hits):
+        lines.append(f'vllm:prefix_cache_hits_total{{engine="{engine}",model_name="org/model"}} {float(hits)}')
+        lines.append(f'vllm:prefix_cache_hits_created{{engine="{engine}",model_name="org/model"}} 1.7e+09')
+    return "\n".join(lines) + "\n"
+
+
+class ContextInstrumentationTest(unittest.TestCase):
+    """The context subcases gate on per-chunk log lines and on /metrics prefix-cache hit tokens."""
+
+    SUBCASES = [
+        {"kind": "long_prefill", "input_tokens": 4088, "output_tokens": 8},
+        {"kind": "chunked_prefill", "input_tokens": 2048, "output_tokens": 8, "expected_min_chunks": 2},
+        {
+            "kind": "cached_prefill",
+            "input_tokens": 2048,
+            "output_tokens": 8,
+            "common_prefix_tokens": 1024,
+            "expected_min_cache_hits": 1024,
+        },
+    ]
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.case = Path(self.temp.name)
+        self.row = {"id": "row", "manifest": {"model": "org/model", "context_subcases": self.SUBCASES}}
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_case(self, snapshots: dict[str, list[str]], chunk_lines: dict[str, int]) -> None:
+        """Lay out a case as the runner leaves it, producing evidence with the runner's own program."""
+
+        source = RUNNER_PATH.read_text()
+        function = source.split("run_context_subcases() {", 1)[1].split("\n}\n", 1)[0]
+        evidence_program = function.split("<<'PY' || return 97\n", 1)[1].split("\nPY\n", 1)[0]
+        log = self.case / "server.log"
+        log.write_bytes(b"startup\nINFO Chunked prefill enabled for org/model: max_num_batched_tokens=1024.\n")
+        for subcase in self.SUBCASES:
+            kind = subcase["kind"]
+            subdir = self.case / "context_subcases" / kind
+            subdir.mkdir(parents=True)
+            (subdir / "client.exit").write_text("0\n")
+            count = subcase["input_tokens"]
+            if kind == "cached_prefill":
+                common = subcase["common_prefix_tokens"]
+                prompts = [[42] * common + [43] * (count - common), [42] * common + [44] * (count - common)]
+            else:
+                prompts = [[42] * count]
+            calls = [
+                {
+                    "request": {
+                        "model": "org/model",
+                        "prompt": prompt,
+                        "max_tokens": subcase["output_tokens"],
+                        "temperature": 0,
+                        "ignore_eos": True,
+                    },
+                    "response": {
+                        "choices": [{"finish_reason": "length"}],
+                        "usage": {"prompt_tokens": count, "completion_tokens": subcase["output_tokens"]},
+                    },
+                }
+                for prompt in prompts
+            ]
+            result = {"schema_version": 2, "subcase": subcase, "calls": calls, "metrics": snapshots[kind]}
+            (subdir / "result.json").write_text(json.dumps(result))
+            start = log.stat().st_size
+            with log.open("ab") as handle:
+                for index in range(chunk_lines.get(kind, 0)):
+                    handle.write(
+                        f"INFO Prefill chunk for request cmpl-{kind}: tokens [{index}, x) of {count}.\n".encode()
+                    )
+                handle.write(b'INFO "POST /v1/completions HTTP/1.1" 200 OK\n')
+            end = log.stat().st_size
+            subprocess.run(
+                [sys.executable, "-", str(self.case), kind, str(start), str(end)],
+                input=evidence_program,
+                text=True,
+                check=True,
+            )
+
+    def errors(self) -> list[str]:
+        validation = validator.Validation()
+        validator.validate_context_subcases(self.case, self.row, {}, validation)
+        return validation.errors
+
+    def passing_snapshots(self) -> dict[str, list[str]]:
+        return {
+            "long_prefill": [metrics_text(0), metrics_text(0)],
+            "chunked_prefill": [metrics_text(0), metrics_text(4032)],
+            "cached_prefill": [metrics_text(4032), metrics_text(5056), metrics_text(6080)],
+        }
+
+    def test_hit_tokens_sum_every_engine_and_ignore_other_series(self) -> None:
+        self.assertEqual(validator.prefix_cache_hit_tokens(metrics_text(1024, 512)), 1536)
+        self.assertIsNone(validator.prefix_cache_hit_tokens("vllm:prefix_cache_queries_total 4096.0\n"))
+
+    def test_chunks_and_second_call_hits_pass(self) -> None:
+        self.write_case(self.passing_snapshots(), {"chunked_prefill": 2})
+
+        self.assertEqual(self.errors(), [])
+        evidence = json.loads((self.case / "context_subcases/cached_prefill/evidence.json").read_text())
+        self.assertEqual(evidence["instrumentation_counts"], {"chunk_events": 0, "last_call_cache_hit_tokens": 1024})
+
+    def test_hits_are_measured_across_the_second_call_alone(self) -> None:
+        """A first call that hits blocks cached by earlier subcases must not carry a missed second call."""
+
+        snapshots = self.passing_snapshots()
+        snapshots["cached_prefill"] = [metrics_text(0), metrics_text(2048), metrics_text(2048)]
+        self.write_case(snapshots, {"chunked_prefill": 2})
+
+        self.assertEqual(
+            self.errors(),
+            [
+                "row/cached_prefill: the second call hit 0 prefix-cache tokens, expected at least 1024"
+                " (expected_min_cache_hits counts tokens)"
+            ],
+        )
+
+    def test_absent_hit_counter_fails(self) -> None:
+        snapshots = self.passing_snapshots()
+        snapshots["cached_prefill"] = ["", "", ""]
+        self.write_case(snapshots, {"chunked_prefill": 2})
+
+        self.assertEqual(
+            self.errors(), ["row/cached_prefill: /metrics snapshots carry no vllm:prefix_cache_hits_total"]
+        )
+
+    def test_unsplit_prefill_fails_the_chunk_check(self) -> None:
+        """The startup line proves the configuration only; it lies outside every subcase segment."""
+
+        self.write_case(self.passing_snapshots(), {"chunked_prefill": 1})
+
+        self.assertEqual(self.errors(), ["row/chunked_prefill: 1 prefill chunk log lines, expected at least 2"])
+
+    def test_missing_snapshots_fail(self) -> None:
+        snapshots = self.passing_snapshots()
+        snapshots["long_prefill"] = [metrics_text(0)]
+        self.write_case(snapshots, {"chunked_prefill": 2})
+
+        self.assertEqual(
+            self.errors(),
+            ["row/long_prefill: result.metrics must hold one /metrics snapshot before and after each call"],
+        )
 
 
 if __name__ == "__main__":

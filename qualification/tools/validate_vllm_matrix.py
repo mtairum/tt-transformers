@@ -84,16 +84,52 @@ MODEL_CLASS_OVERRIDE_ENTRY = re.compile(
 FABRIC_CONFIG_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 CONTEXT_CLIENT_PROGRAM = r"""import json,pathlib,sys,urllib.request
 spec=json.loads(sys.argv[1]); host=sys.argv[2]; port=sys.argv[3]; model=sys.argv[4]; output=pathlib.Path(sys.argv[5])
+def metrics():
+    with urllib.request.urlopen(f"http://{host}:{port}/metrics",timeout=60) as response:return response.read().decode()
 def call(prompt):
     payload={"model":model,"prompt":prompt,"max_tokens":spec["output_tokens"],"temperature":0,"ignore_eos":True}
     request=urllib.request.Request(f"http://{host}:{port}/v1/completions",data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST")
     with urllib.request.urlopen(request,timeout=1800) as response:return {"request":payload,"response":json.loads(response.read())}
 count=spec["input_tokens"]
 if spec["kind"]=="cached_prefill":
-    common=spec["common_prefix_tokens"]; first=[42]*common+[43]*(count-common); second=[42]*common+[44]*(count-common)
-    calls=[call(first),call(second)]
-else:calls=[call([42]*count)]
-output.write_text(json.dumps({"schema_version":1,"subcase":spec,"calls":calls},indent=2)+"\n")"""
+    common=spec["common_prefix_tokens"]; prompts=[[42]*common+[43]*(count-common),[42]*common+[44]*(count-common)]
+else:prompts=[[42]*count]
+snapshots=[metrics()]; calls=[]
+for prompt in prompts:
+    calls.append(call(prompt)); snapshots.append(metrics())
+output.write_text(json.dumps({"schema_version":2,"subcase":spec,"calls":calls,"metrics":snapshots},indent=2)+"\n")"""
+
+
+# The plugin logs one line per scheduled chunk of a split prefill. vLLM exposes
+# no chunk counter on /metrics, and an intermediate chunk emits no token.
+PREFILL_CHUNK_LINE = re.compile(rb"Prefill chunk for request ")
+# vLLM counts prefix-cache hits in tokens, one series per engine; the
+# Prometheus exposition appends _total to the counter name.
+PREFIX_CACHE_HITS = re.compile(r"^vllm:prefix_cache_hits_total(?:\{[^}\n]*\})? (\S+)$", re.M)
+
+
+def prefix_cache_hit_tokens(metrics_text: str) -> float | None:
+    """Return the prefix-cache hit-token counter summed over engines, or None when it is absent."""
+
+    values = PREFIX_CACHE_HITS.findall(metrics_text)
+    return sum(float(value) for value in values) if values else None
+
+
+def context_instrumentation(segment: bytes, result: Any) -> dict[str, int | None]:
+    """Recompute a context subcase's instrumentation from the server-log segment and /metrics snapshots.
+
+    ``last_call_cache_hit_tokens`` is the hit-token delta across the last call
+    alone. Earlier calls and subcases send the same leading tokens, so a delta
+    over the whole subcase would count their cached blocks too.
+    """
+
+    snapshots = result.get("metrics") if isinstance(result, dict) else None
+    hits = None
+    if isinstance(snapshots, list) and len(snapshots) >= 2 and all(isinstance(text, str) for text in snapshots):
+        before, after = prefix_cache_hit_tokens(snapshots[-2]), prefix_cache_hit_tokens(snapshots[-1])
+        if before is not None and after is not None:
+            hits = int(after - before)
+    return {"chunk_events": len(PREFILL_CHUNK_LINE.findall(segment)), "last_call_cache_hit_tokens": hits}
 
 
 class Validation:
@@ -1339,7 +1375,7 @@ def validate_context_subcases(
             f"{row_id}/{kind}: evidence",
             validation,
         )
-        validation.equal(evidence.get("schema_version"), 1, f"{row_id}/{kind}: evidence schema_version")
+        validation.equal(evidence.get("schema_version"), 2, f"{row_id}/{kind}: evidence schema_version")
         start, end = evidence.get("server_log_start"), evidence.get("server_log_end")
         validation.require(
             isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(server_bytes),
@@ -1353,13 +1389,10 @@ def validate_context_subcases(
             hashlib.sha256(segment).hexdigest(),
             f"{row_id}/{kind}: server segment hash",
         )
-        actual_counts = {
-            "chunk_events": len(re.findall(rb"(?:chunked[^\n]*prefill|prefill[^\n]*chunk)", segment, re.I)),
-            "cache_hits": len(re.findall(rb"(?:cache[^\n]*hit|prefix[^\n]*cache[^\n]*hit)", segment, re.I)),
-        }
+        actual_counts = context_instrumentation(segment, evidence.get("result"))
         validate_exact_fields(
             evidence.get("instrumentation_counts"),
-            {"chunk_events", "cache_hits"},
+            {"chunk_events", "last_call_cache_hit_tokens"},
             set(),
             f"{row_id}/{kind}: instrumentation_counts",
             validation,
@@ -1370,12 +1403,18 @@ def validate_context_subcases(
         if kind == "chunked_prefill":
             validation.require(
                 actual_counts["chunk_events"] >= subcase["expected_min_chunks"],
-                f"{row_id}/{kind}: insufficient chunk instrumentation",
+                f"{row_id}/{kind}: {actual_counts['chunk_events']} prefill chunk log lines,"
+                f" expected at least {subcase['expected_min_chunks']}",
             )
         if kind == "cached_prefill":
+            hits = actual_counts["last_call_cache_hit_tokens"]
             validation.require(
-                actual_counts["cache_hits"] >= subcase["expected_min_cache_hits"],
-                f"{row_id}/{kind}: insufficient cache-hit instrumentation",
+                hits is not None, f"{row_id}/{kind}: /metrics snapshots carry no vllm:prefix_cache_hits_total"
+            )
+            validation.require(
+                hits is None or hits >= subcase["expected_min_cache_hits"],
+                f"{row_id}/{kind}: the second call hit {hits} prefix-cache tokens,"
+                f" expected at least {subcase['expected_min_cache_hits']} (expected_min_cache_hits counts tokens)",
             )
         result = evidence.get("result")
         validation.require(
@@ -1386,14 +1425,21 @@ def validate_context_subcases(
             continue
         validate_exact_fields(
             result,
-            {"schema_version", "subcase", "calls"},
+            {"schema_version", "subcase", "calls", "metrics"},
             set(),
             f"{row_id}/{kind}: result",
             validation,
         )
-        validation.equal(result.get("schema_version"), 1, f"{row_id}/{kind}: result schema_version")
+        validation.equal(result.get("schema_version"), 2, f"{row_id}/{kind}: result schema_version")
         expected_calls = 2 if kind == "cached_prefill" else 1
         validation.equal(len(result["calls"]), expected_calls, f"{row_id}/{kind}: call count")
+        snapshots = result.get("metrics")
+        validation.require(
+            isinstance(snapshots, list)
+            and len(snapshots) == expected_calls + 1
+            and all(isinstance(text, str) for text in snapshots),
+            f"{row_id}/{kind}: result.metrics must hold one /metrics snapshot before and after each call",
+        )
         for index, call in enumerate(result["calls"]):
             validate_exact_fields(
                 call,
