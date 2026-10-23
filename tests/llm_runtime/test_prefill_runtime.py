@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib
 import inspect
 import math
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -639,6 +641,48 @@ def test_chunk_mapping_uses_absolute_blocks_pads_sentinels_and_stops_after_last_
     assert len(early_stop.chunks) == 3
     assert early_stop.chunks[-1].token_slice == slice(4096, 6144)
     assert early_stop.chunks[-1].contains_last_token
+
+
+@pytest.mark.host
+def test_near_limit_continuation_checks_only_the_chunks_that_run_against_the_page_table():
+    layout = PageTableLayout.resolve(
+        block_size=32,
+        model_max_sequence_length=16384,
+        physical_num_blocks=4096,
+        max_prefill_chunk_size=2048,
+    )
+    prompt_length, cached_tokens = 16000, 11264
+    tokens, page_table, prompt_lens, start_pos = _inputs(
+        prompt_length=prompt_length,
+        cached_tokens=cached_tokens,
+        page_width=layout.prefill_width,
+    )
+
+    def plan(canonical_page_table_width):
+        return _plan_prefill_requests(
+            tokens=tokens,
+            page_table=page_table,
+            prompt_lens=prompt_lens,
+            empty_slots=(0,),
+            start_pos=start_pos,
+            block_size=32,
+            max_batch_size=32,
+            max_prefill_chunk_size=2048,
+            supports_batched_prefill=True,
+            max_actual_page_table_width=layout.raw_capacity_width,
+            canonical_page_table_width=canonical_page_table_width,
+        )
+
+    # The 4736-token tail pads to 8192, which would end past the table, but the
+    # chunk walk stops at the chunk holding the last token.
+    request = plan(layout.prefill_width)[0]
+    assert cached_tokens + request.padded_sequence_length > layout.prefill_width * 32
+    assert [chunk.chunk_start_idx for chunk in request.chunks] == [11264, 13312, 15360]
+    assert request.chunks[-1].contains_last_token
+    assert request.chunks[-1].chunk_start_idx + request.chunks[-1].chunk_size <= layout.prefill_width * 32
+
+    with pytest.raises(ValueError, match="canonical page-table capacity"):
+        plan(layout.raw_capacity_width)
 
 
 @pytest.mark.host
@@ -3205,3 +3249,35 @@ def test_eager_degrade_ignores_malformed_request_metadata(warnings_logged):
     runtime = _runtime()
     runtime.note_eager_degrade(tokens=torch.zeros(4, dtype=torch.long))
     assert warnings_logged == []
+
+
+def _returns_hidden_without_slice_guard(function: ast.FunctionDef) -> bool:
+    for node in ast.walk(function):
+        if not isinstance(node, ast.If) or not any(isinstance(stmt, ast.Return) for stmt in node.body):
+            continue
+        names = {child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)}
+        if "get_last_token" in names and "last_token_slice" not in names:
+            return True
+    return False
+
+
+@pytest.mark.host
+@pytest.mark.parametrize(
+    "model_path",
+    sorted((Path(__file__).parents[2] / "src/tt_transformers/models").glob("*/model.py")),
+    ids=lambda path: path.parent.name,
+)
+def test_model_prefill_honours_runtime_last_token_slice(model_path):
+    # The eager chunk body passes get_last_token=-1 with a runtime last_token_slice
+    # and expects last-token logits. A model that returns the full hidden state
+    # whenever get_last_token is -1 hands the collector a hidden-width row.
+    tree = ast.parse(model_path.read_text(encoding="utf-8"))
+    offenders = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "prefill_forward"
+        and "last_token_slice" in {arg.arg for arg in node.args.args + node.args.kwonlyargs}
+        and _returns_hidden_without_slice_guard(node)
+    ]
+    assert not offenders

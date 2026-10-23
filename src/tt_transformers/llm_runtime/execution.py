@@ -727,6 +727,14 @@ class TracedExecutor:
                         full_without_device_feedback=operation_plan.refresh_policy.full_without_device_feedback,
                         refresh_page_table_on_change=operation_plan.refresh_policy.refresh_page_table_on_change,
                     ),
+                    prime=(
+                        (lambda persistent, plan=operation_plan: plan.prime(persistent.values))
+                        if operation_plan.prime is not None
+                        else None
+                    ),
+                    release_prime_output=(
+                        operation_plan.release_prime_output if operation_plan.prime is not None else None
+                    ),
                 )
             )
         return program

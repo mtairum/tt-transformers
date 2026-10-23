@@ -69,10 +69,13 @@ class Qwen3_32BGenerator:
         "supports_sample_on_device": True,
         "max_device_top_k": 32,
         "accepts_trace_mode": True,
-        # Every supported multi-device geometry (T3K, P150x4) needs a ring
-        # fabric. The vLLM plugin (vllm-tt-plugin #116) otherwise defaults a
-        # mesh it is not told about to FABRIC_1D.
-        "fabric_config": {"config": ttnn.FabricConfig.FABRIC_1D_RING},
+        "supports_chunked_prefill": True,
+        "supports_device_logprobs": False,
+        # Every supported multi-device geometry (T3K, P150x4) serves on FABRIC_1D,
+        # the vLLM plugin's default for these meshes (vllm-tt-plugin #116); the
+        # model's Ring collectives run on it, as TTTv1's do. Declared explicitly so
+        # the choice is a visible one-liner rather than an inherited default.
+        "fabric_config": {"config": ttnn.FabricConfig.FABRIC_1D},
     }
     requires_prefill_trace_warmup = True
 
@@ -139,7 +142,7 @@ class Qwen3_32BGenerator:
                 max_seq_len=max_seq_len,
                 n_layers=n_layers,
                 tt_data_parallel=tt_data_parallel,
-                optimizations=optimizations,
+                optimizations="performance" if optimizations is None else optimizations,
                 trace_mode=trace_mode,
                 device_sampling_enabled=device_sampling_enabled,
             )
@@ -315,6 +318,7 @@ def build_qwen3_32b_generator(config: Qwen3_32BGeneratorConfig) -> Qwen3_32BGene
                     dtype=model_kv_cache_dtypes[0],
                 ),
                 device_sampling_enabled=config.device_sampling_enabled,
+                sequential_prefill=True,
             )
             lanes.append(build_qwen3_32b_executor(llm, executor_config))
         adapter = _build_vllm_adapter(lanes[0])
