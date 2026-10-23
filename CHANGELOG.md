@@ -35,6 +35,13 @@ All notable changes to this project will be documented here.
 - On-device greedy sampling breaks an exact logit tie by the lowest token id,
   as host argmax does. Before, the pick depended on the batch slot and could
   vary between runs.
+- vLLM serving of Qwen2.5-72B (T3K) and Qwen2.5-7B (N300) prefills prompts in
+  the 128-token bucket in fixed waves of four rows, padding a partial wave, and
+  warms exactly that shape. Under many concurrent short prompts, time to first
+  token falls by more than half against one prompt per pass; a lone short
+  prompt waits 85–106 ms longer. Greedy output on these prompts is
+  deterministic but is the four-row pass's text, so it differs from one-row
+  prefill and from TTTv1: pinned greedy texts for these two models move once.
 
 This is a developer preview. No model is promoted beyond the support status in
 `SUPPORT.md` and its example manifest.
