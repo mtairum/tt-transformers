@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## 2.0.0.dev0
 
+- `get_device_name` gives a Quasar device the Blackhole names (`P150`, `P300`,
+  `P150x4`, `P150x8`, `BHGLX`), so code keyed on those names runs on Quasar.
 - Establish `tt-transformers` as the standalone package for TTTv2 modules,
   runtime components, sampling, and twelve experimental model families.
 - Add reproducible package builds and CPython 3.10/3.12 host validation.
